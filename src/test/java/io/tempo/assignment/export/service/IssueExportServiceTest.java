@@ -5,12 +5,16 @@ import io.tempo.assignment.export.model.ExportRequest;
 import io.tempo.assignment.export.model.ExportRow;
 import io.tempo.assignment.export.source.InMemoryIssuePageSource;
 import io.tempo.assignment.export.source.Issue;
+import io.tempo.assignment.export.source.IssuePageSource;
 import org.junit.Test;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static io.tempo.assignment.export.fixture.SampleIssues.F_ID;
 import static io.tempo.assignment.export.fixture.SampleIssues.F_KEY;
@@ -134,8 +138,212 @@ public class IssueExportServiceTest {
         }
     }
 
-    // --- TODO (candidate) -------------------------------------------------------------
-    // Add at least two tests of your own that pin down behaviour the tests above do not
-    // cover. Ideas: an empty field list; a source that is queried the right number of
-    // times (use a counting test double); a null request. Choose what you think matters.
+    // --- pagination (candidate-written) ------------------------------------------------
+
+    /** A test double that returns fixed-size pages and counts how often it was called. */
+    private static final class CountingFixedSizePageSource implements IssuePageSource {
+        private final int[] pageSizes;
+        private int calls = 0;
+
+        CountingFixedSizePageSource(int... pageSizes) {
+            this.pageSizes = pageSizes;
+        }
+
+        @Override
+        public List<Issue> fetchPage(int startAt, int maxPerPage) {
+            List<Issue> page = new ArrayList<>();
+            if (calls < pageSizes.length) {
+                for (int i = 0; i < pageSizes[calls]; i++) {
+                    page.add(new Issue(startAt + i, "K-" + (startAt + i), "P", "s", "Open",
+                            null, Collections.emptyMap()));
+                }
+            }
+            calls++;
+            return page;
+        }
+
+        int callCount() {
+            return calls;
+        }
+    }
+
+    @Test
+    public void fetchAllStopsAfterFirstShortPageAndDoesNotCallSourceAgain() {
+        CountingFixedSizePageSource source = new CountingFixedSizePageSource(2, 2, 2, 1);
+        IssueExportServiceImpl service = new IssueExportServiceImpl(source);
+
+        List<Issue> all = service.fetchAll(2);
+
+        assertEquals(7, all.size());
+        assertEquals(4, source.callCount());
+    }
+
+    @Test
+    public void fetchAllReturnsAllRawRowsInOrderRegardlessOfPageSize() {
+        IssueExportServiceImpl service = new IssueExportServiceImpl(SampleIssues.newSource());
+
+        List<Issue> all = service.fetchAll(3);
+
+        assertEquals(SampleIssues.rawRows(), all);
+    }
+
+    @Test
+    public void fetchAllOnEmptySourceReturnsEmptyAfterOneCall() {
+        CountingFixedSizePageSource source = new CountingFixedSizePageSource();
+        IssueExportServiceImpl service = new IssueExportServiceImpl(source);
+
+        List<Issue> all = service.fetchAll(10);
+
+        assertTrue(all.isEmpty());
+        assertEquals(1, source.callCount());
+    }
+
+    // --- field projection (candidate-written) ------------------------------------------
+
+    @Test
+    public void projectsFieldsInRequestedOrderEvenWhenNotDefaultOrder() {
+        List<ExportRow> rows = serviceOverFixture()
+                .export(request(10, F_PRIORITY, F_ID, F_KEY));
+
+        ExportRow first = rows.get(0); // issue id=1
+        assertEquals(Arrays.asList(F_PRIORITY, F_ID, F_KEY),
+                new ArrayList<>(first.getValues().keySet()));
+    }
+
+    @Test
+    public void emptyFieldListProducesOneEmptyRowPerDistinctIssue() {
+        List<ExportRow> rows = serviceOverFixture().export(request(10));
+
+        assertEquals(SampleIssues.DISTINCT_ISSUE_COUNT, rows.size());
+        for (ExportRow row : rows) {
+            assertTrue(row.getValues().isEmpty());
+        }
+    }
+
+    // --- validation (candidate-written) -------------------------------------------------
+
+    @Test
+    public void rejectsNegativePageSize() {
+        try {
+            serviceOverFixture().export(request(-1, F_ID));
+            fail("expected IllegalArgumentException for maxPerPage < 1");
+        } catch (IllegalArgumentException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void rejectsNullRequest() {
+        try {
+            serviceOverFixture().export(null);
+            fail("expected IllegalArgumentException for a null request");
+        } catch (IllegalArgumentException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void rejectsRequestWithNullFields() {
+        try {
+            serviceOverFixture().export(new ExportRequest(null, 10));
+            fail("expected IllegalArgumentException for null fields");
+        } catch (IllegalArgumentException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void emptyFieldsListIsNotTreatedAsNullFields() {
+        // Negative control: an empty field list is Task 4's valid "no columns" case, distinct
+        // from the null-fields rejection above — must not throw.
+        List<ExportRow> rows = serviceOverFixture()
+                .export(new ExportRequest(Collections.emptyList(), 10));
+
+        assertEquals(SampleIssues.DISTINCT_ISSUE_COUNT, rows.size());
+    }
+
+    // --- additional de-duplication & pagination edge cases (candidate-written) ---------
+
+    private static Issue issue(long id, String key, Instant updated, String priority) {
+        Map<String, Object> customFields = new LinkedHashMap<>();
+        customFields.put(F_PRIORITY, priority);
+        return new Issue(id, key, "P", "s", "Open", updated, customFields);
+    }
+
+    @Test
+    public void duplicateWithEqualNonNullUpdatedKeepsTheFirstSeenValue() {
+        // Spec 3.2: "equal (or null)" both fall back to first-seen. The shared fixture only
+        // exercises the null half (issue #2/#6); this covers the equal-non-null half.
+        Instant sameInstant = SampleIssues.JAN_11;
+        IssuePageSource source = new InMemoryIssuePageSource(Arrays.asList(
+                issue(1, "K-1", sameInstant, "First"),
+                issue(1, "K-1", sameInstant, "Second")));
+        IssueExportService service = new IssueExportServiceImpl(source);
+
+        List<ExportRow> rows = service.export(request(10, F_ID, F_PRIORITY));
+
+        assertEquals(1, rows.size());
+        assertEquals("First", rows.get(0).get(F_PRIORITY));
+    }
+
+    @Test
+    public void tripleDuplicateKeepsTheOverallNewestNotJustTheLastComparison() {
+        // Three occurrences of the same id, with the newest one in the middle of the run —
+        // catches an implementation that folds pairwise against the previous raw row instead
+        // of against the current best-seen winner.
+        IssuePageSource source = new InMemoryIssuePageSource(Arrays.asList(
+                issue(1, "K-1", SampleIssues.JAN_10, "Low"),
+                issue(1, "K-1", SampleIssues.MAR_01, "Critical"),   // overall newest
+                issue(1, "K-1", SampleIssues.JAN_12, "Medium")));   // newer than #1, older than #2
+        IssueExportService service = new IssueExportServiceImpl(source);
+
+        List<ExportRow> rows = service.export(request(10, F_ID, F_PRIORITY, F_UPDATED));
+
+        assertEquals(1, rows.size());
+        assertEquals("Critical", rows.get(0).get(F_PRIORITY));
+        assertEquals(SampleIssues.MAR_01, rows.get(0).get(F_UPDATED));
+    }
+
+    @Test
+    public void fetchAllMakesOneExtraEmptyCallWhenLastRealPageIsExactlyFull() {
+        // When the last real page happens to be exactly maxPerPage in size, the "short page
+        // means stop" rule can't apply to it — the implementation must page once more and see
+        // an empty page before it stops.
+        CountingFixedSizePageSource source = new CountingFixedSizePageSource(2, 2, 2, 2);
+        IssueExportServiceImpl service = new IssueExportServiceImpl(source);
+
+        List<Issue> all = service.fetchAll(2);
+
+        assertEquals(8, all.size());
+        assertEquals(5, source.callCount());
+    }
+
+    @Test
+    public void repeatedFieldIdInRequestCollapsesToASingleRowEntry() {
+        // Not forbidden by the spec, but surprising: ExportRow is backed by a LinkedHashMap
+        // keyed by field id, so requesting the same id twice yields one entry, not two. This
+        // pins down that documented behavior (see NOTES.md).
+        List<ExportRow> rows = serviceOverFixture().export(request(10, F_ID, F_ID));
+
+        ExportRow first = rows.get(0);
+        assertEquals(1, first.getValues().size());
+        assertEquals(Collections.singletonList(F_ID), new ArrayList<>(first.getValues().keySet()));
+    }
+
+    @Test
+    public void explicitNullCustomFieldValueIsIndistinguishableFromAMissingOne() {
+        Map<String, Object> withExplicitNull = new LinkedHashMap<>();
+        withExplicitNull.put(F_PRIORITY, null);
+        IssuePageSource source = new InMemoryIssuePageSource(Arrays.asList(
+                new Issue(1, "K-1", "P", "s", "Open", null, withExplicitNull),
+                new Issue(2, "K-2", "P", "s", "Open", null, Collections.emptyMap())));
+        IssueExportService service = new IssueExportServiceImpl(source);
+
+        List<ExportRow> rows = service.export(request(10, F_ID, F_PRIORITY));
+
+        assertNull(rows.get(0).get(F_PRIORITY)); // explicit null value
+        assertNull(rows.get(1).get(F_PRIORITY)); // key entirely absent
+        assertTrue(rows.get(0).getValues().containsKey(F_PRIORITY));
+        assertTrue(rows.get(1).getValues().containsKey(F_PRIORITY));
+    }
 }
