@@ -156,7 +156,7 @@ attempt at everything. Pick at most one and mention it in your notes:
 
 ## 6. How to submit
 
-- Push to a branch and open a PR **or** send a zip of the project (must build with `mvn test`).
+- Send a zip of the project (must build with `mvn test`).
 - Please keep the git history readable if you use a branch.
 
 Good luck — and if any requirement is ambiguous, make a reasonable decision and write it
